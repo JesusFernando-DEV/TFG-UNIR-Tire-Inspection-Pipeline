@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 import pytesseract
+from pytesseract import Output
 import re
 import sys
 from datetime import datetime
@@ -281,31 +282,242 @@ def extraer_mejor_candidato_texto(roi_morph, roi_bgr):
 
     return mejor_roi, vis
 
-
-def extraer_texto_dot(roi_ocr):
+def preparar_variantes_ocr(roi_bgr):
     """
-    Esta función aplica Tesseract OCR sobre la región de interés
-    ya preprocesada y devuelve el texto bruto y una posible cadena
-    DOT válida de 4 dígitos.
+    Genera varias versiones de la ROI para mejorar la robustez del OCR.
     """
-    config = r'--oem 3 --psm 7 -c tessedit_char_whitelist=0123456789DOT'
+    variantes = []
 
-    texto = pytesseract.image_to_string(roi_ocr, config=config)
-    texto_limpio = re.sub(r'[^A-Z0-9]', '', texto.upper())
+    gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
 
-    coincidencias = re.findall(r'\d{4}', texto_limpio)
+    # Reescalado para dar más tamaño a los caracteres
+    gray_big = cv2.resize(gray, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
 
-    dot_final = None
+    # Filtro que preserva bordes mejor que un blur gaussiano simple
+    bilateral = cv2.bilateralFilter(gray_big, 9, 75, 75)
+
+    # CLAHE
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(bilateral)
+
+    # Otsu binaria normal
+    _, otsu_bin = cv2.threshold(clahe, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # Otsu binaria invertida
+    _, otsu_inv = cv2.threshold(clahe, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    # Adaptativa normal
+    adap_bin = cv2.adaptiveThreshold(
+        clahe, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY, 31, 8
+    )
+
+    # Adaptativa invertida
+    adap_inv = cv2.adaptiveThreshold(
+        clahe, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV, 31, 8
+    )
+
+    kernel = np.ones((2, 2), np.uint8)
+
+    otsu_bin = cv2.morphologyEx(otsu_bin, cv2.MORPH_CLOSE, kernel)
+    otsu_inv = cv2.morphologyEx(otsu_inv, cv2.MORPH_CLOSE, kernel)
+    adap_bin = cv2.morphologyEx(adap_bin, cv2.MORPH_CLOSE, kernel)
+    adap_inv = cv2.morphologyEx(adap_inv, cv2.MORPH_CLOSE, kernel)
+
+    variantes.append(("gray_big", gray_big))
+    variantes.append(("clahe", clahe))
+    variantes.append(("otsu_bin", otsu_bin))
+    variantes.append(("otsu_inv", otsu_inv))
+    variantes.append(("adap_bin", adap_bin))
+    variantes.append(("adap_inv", adap_inv))
+
+    return variantes
+
+
+def validar_dot(cadena):
+    """
+    Devuelve un DOT válido de 4 dígitos si encuentra alguno
+    compatible con semana/año.
+    """
+    coincidencias = re.findall(r'\d{4}', cadena)
+
+    coincidencias_validas = []
     for c in coincidencias:
         semana = int(c[:2])
-        anio = int(c[2:])
-
         if 1 <= semana <= 53:
-            dot_final = c
-            break
+            coincidencias_validas.append(c)
 
-    return texto_limpio, dot_final
+    if len(coincidencias_validas) > 0:
+        return coincidencias_validas[-1]
 
+    return None
+
+
+def extraer_texto_dot_multiple(roi_bgr):
+    """
+    Prueba varias estrategias de OCR sobre distintas versiones
+    de la misma ROI y devuelve la mejor coincidencia encontrada.
+    """
+    variantes = preparar_variantes_ocr(roi_bgr)
+
+    h, w = roi_bgr.shape[:2]
+
+    x_inicio = int(w * 0.60)
+    roi_derecha = roi_bgr[:, x_inicio:w]
+    roi_derecha = cv2.resize(roi_derecha, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+    roi_derecha_gray = cv2.cvtColor(roi_derecha, cv2.COLOR_BGR2GRAY)
+
+    roi_derecha_bin_inv = cv2.adaptiveThreshold(
+        roi_derecha_gray, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        31, 11
+    )
+
+    roi_derecha_bin = cv2.adaptiveThreshold(
+        roi_derecha_gray, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        31, 11
+    )
+
+    variantes_derecha = [
+        ("derecha_gray", roi_derecha_gray),
+        ("derecha_bin", roi_derecha_bin),
+        ("derecha_bin_inv", roi_derecha_bin_inv),
+    ]
+
+    configs = [
+        r'--oem 3 --psm 7 -c tessedit_char_whitelist=DOT0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ',
+        r'--oem 3 --psm 13 -c tessedit_char_whitelist=DOT0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ',
+        r'--oem 3 --psm 8 -c tessedit_char_whitelist=DOT0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ',
+        r'--oem 3 --psm 7 -c tessedit_char_whitelist=0123456789'
+    ]
+
+    mejor_texto = ""
+    mejor_dot = None
+    mejor_variante = None
+
+    for nombre, img in variantes:
+        img_borde = cv2.copyMakeBorder(img, 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=255)
+
+        for cfg in configs:
+            texto = pytesseract.image_to_string(img_borde, config=cfg)
+            texto_limpio = re.sub(r'[^A-Z0-9]', '', texto.upper())
+            dot = validar_dot(texto_limpio)
+
+            if dot is not None:
+                return texto_limpio, dot, nombre
+
+            if len(texto_limpio) > len(mejor_texto):
+                mejor_texto = texto_limpio
+                mejor_variante = nombre
+                mejor_dot = dot
+
+    for nombre, img in variantes_derecha:
+        img_borde = cv2.copyMakeBorder(img, 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=255)
+        h2, w2 = img_borde.shape[:2]
+
+        subrois_candidatas = [
+            ("r2b", int(w2 * 0.48), int(h2 * 0.28), w2, int(h2 * 0.85)),
+            ("r2c", int(w2 * 0.50), int(h2 * 0.22), w2, int(h2 * 0.82)),
+            ("r2", int(w2 * 0.55), int(h2 * 0.35), w2, int(h2 * 0.80)),
+            ("r1", int(w2 * 0.55), int(h2 * 0.20), w2, int(h2 * 0.65)),
+            ("r3", int(w2 * 0.45), int(h2 * 0.30), w2, int(h2 * 0.78)),
+            ("r4", int(w2 * 0.60), int(h2 * 0.15), w2, int(h2 * 0.60))
+        ]
+
+        for subroi_nombre, x1, y1, x2, y2 in subrois_candidatas:
+            img_0222_base = img_borde[y1:y2, x1:x2].copy()
+            img_0222_proc = cv2.resize(img_0222_base, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+
+            cv2.imwrite(rf"C:\Users\Chus\Downloads\TFE\debug_{subroi_nombre}_base.png", img_0222_base)
+            cv2.imwrite(rf"C:\Users\Chus\Downloads\TFE\debug_{subroi_nombre}_proc.png", img_0222_proc)
+
+            print(f"[SUBROI] {subroi_nombre} base shape={img_0222_base.shape} proc shape={img_0222_proc.shape}")
+
+            for psm in [11, 8, 7]:
+                data = pytesseract.image_to_data(
+                    img_0222_proc,
+                    config=f'--oem 3 --psm {psm} -c tessedit_char_whitelist=0123456789',
+                    output_type=Output.DICT
+                )
+
+                candidatos = []
+
+                for i in range(len(data["text"])):
+                    txt = data["text"][i].strip()
+                    conf = data["conf"][i]
+
+                    try:
+                        conf = float(conf)
+                    except:
+                        conf = -1
+
+                    txt_limpio = re.sub(r'[^0-9]', '', txt)
+
+                    left = data["left"][i]
+                    top = data["top"][i]
+                    width = data["width"][i]
+                    height = data["height"][i]
+
+                    alto_ocr, ancho_ocr = img_0222_proc.shape[:2]
+                    
+                    aspecto = width / float(height) if height > 0 else 0
+
+                    if (
+                        txt_limpio
+                        and left > ancho_ocr * 0.05
+                        and 12 <= width <= ancho_ocr * 0.18
+                        and 30 <= height <= alto_ocr * 0.35
+                        and 0.08 <= aspecto <= 1.2
+                        and conf >= 20
+                    ):
+                        candidatos.append((
+                            left,
+                            txt_limpio,
+                            conf,
+                            top,
+                            width,
+                            height
+                        ))
+
+                if not candidatos:
+                    texto_fallback = pytesseract.image_to_string(
+                        img_0222_proc,
+                        config=f'--oem 3 --psm {psm} -c tessedit_char_whitelist=0123456789'
+                    )
+                    texto_fallback = re.sub(r'[^0-9]', '', texto_fallback)
+
+                    print(f"[OCR derecha string] variante={nombre} subroi={subroi_nombre} psm={psm} texto={texto_fallback}")
+
+                    if len(texto_fallback) == 4 and texto_fallback.isdigit():
+                        return texto_fallback, validar_dot(texto_fallback), f"derecha_string_{subroi_nombre}_psm{psm}_" + nombre
+                    
+                    if len(texto_fallback) >= 2 and len(texto_fallback) > len(mejor_texto):
+                        mejor_texto = texto_fallback
+                        mejor_variante = f"derecha_string_{subroi_nombre}_psm{psm}_" + nombre
+                        mejor_dot = validar_dot(texto_fallback)
+
+                print(f"[OCR derecha data] variante={nombre} subroi={subroi_nombre} psm={psm} candidatos={candidatos}")
+
+                if candidatos:
+                    candidatos = sorted(candidatos, key=lambda x: x[0])
+                    texto_limpio = ''.join([c[1] for c in candidatos])
+                    dot = validar_dot(texto_limpio)
+
+                    if dot is not None:
+                        return texto_limpio, dot, f"derecha_data_{subroi_nombre}_psm{psm}_" + nombre
+
+                    if len(texto_limpio) == 4 and texto_limpio.isdigit():
+                        return texto_limpio, validar_dot(texto_limpio), f"derecha_data_{subroi_nombre}_psm{psm}_" + nombre
+                    
+                    if len(texto_limpio) >= 2 and len(texto_limpio) > len(mejor_texto):
+                        mejor_texto = texto_limpio
+                        mejor_variante = f"derecha_data_{subroi_nombre}_psm{psm}_" + nombre
+                        mejor_dot = validar_dot(texto_limpio)
+
+    return mejor_texto, mejor_dot, mejor_variante
 
 def evaluar_caducidad_dot(dot):
     """
@@ -325,7 +537,7 @@ def evaluar_caducidad_dot(dot):
 
     antiguedad = (anio_actual - anio_completo) + ((semana_actual - semana) / 52.0)
 
-    if antiguedad > 6:
+    if antiguedad > 5:
         estado = "Neumático potencialmente caducado o envejecido"
     else:
         estado = "Neumático dentro del intervalo temporal definido"
@@ -350,6 +562,19 @@ def escribir_resultado_final(img_final, dot, estado):
     cv2.putText(img_final, texto1, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
     cv2.putText(img_final, texto2, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
+def redimensionar_si_muy_grande(img_color, max_lado=2500):
+    h, w = img_color.shape[:2]
+    lado_mayor = max(h, w)
+
+    if lado_mayor <= max_lado:
+        return img_color
+
+    escala = max_lado / lado_mayor
+    nuevo_w = int(w * escala)
+    nuevo_h = int(h * escala)
+
+    img_redim = cv2.resize(img_color, (nuevo_w, nuevo_h), interpolation=cv2.INTER_AREA)
+    return img_redim
 
 def ejecutar_pipeline_dot(image_path):
     """
@@ -359,7 +584,13 @@ def ejecutar_pipeline_dot(image_path):
     img_color = cv2.imread(image_path, cv2.IMREAD_COLOR)
 
     if img_color is None:
-        raise ValueError("No se ha podido leer la imagen indicada.")
+        raise ValueError("No se pudo cargar la imagen")
+
+    print("Tamaño original:", img_color.shape[:2])
+
+    img_color = redimensionar_si_muy_grande(img_color, max_lado=2500)
+
+    print("Tamaño ajustado:", img_color.shape[:2])
 
     img_gray = cv2.cvtColor(img_color, cv2.COLOR_BGR2GRAY)
     img_clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8)).apply(img_gray)
@@ -402,9 +633,7 @@ def ejecutar_pipeline_dot(image_path):
 
     roi_texto, roi_contornos = extraer_mejor_candidato_texto(roi_morph_2, roi_deskew)
 
-    roi_texto_gray, roi_texto_clahe, roi_texto_bin, roi_texto_morph = preprocesar_roi_para_ocr(roi_texto)
-
-    texto_limpio, dot_detectado = extraer_texto_dot(roi_texto_morph)
+    texto_limpio, dot_detectado, variante_ocr = extraer_texto_dot_multiple(roi_texto)
 
     estado_dot, antiguedad = evaluar_caducidad_dot(dot_detectado)
 
@@ -427,13 +656,14 @@ def ejecutar_pipeline_dot(image_path):
         "roi_deskew": roi_deskew,
         "roi_contornos": roi_contornos,
         "roi_texto": roi_texto,
-        "roi_texto_morph": roi_texto_morph,
+        #"roi_texto_morph": roi_texto_morph,
         "img_final": img_final,
         "dot_detectado": dot_detectado,
         "texto_limpio": texto_limpio,
         "estado_dot": estado_dot,
         "antiguedad": antiguedad,
-        "angulo_deskew": angle
+        "angulo_deskew": angle,
+        "variante_ocr": variante_ocr
     }
 
     return resultado
@@ -451,7 +681,7 @@ class AplicacionDOT:
 
         self.label_titulo = tk.Label(
             root,
-            text="Pipeline DOT - feature-DOT-funcion",
+            text="Pipeline DOT - rama:feature-DOT-funcion",
             font=("Arial", 16, "bold")
         )
         self.label_titulo.pack(pady=10)
@@ -520,6 +750,7 @@ class AplicacionDOT:
             texto = resultado["texto_limpio"]
             estado = resultado["estado_dot"]
             angulo = resultado["angulo_deskew"]
+            variante = resultado["variante_ocr"]
 
             if resultado["antiguedad"] is not None:
                 antiguedad_txt = f"{resultado['antiguedad']:.2f} años"
@@ -528,6 +759,7 @@ class AplicacionDOT:
 
             texto_resultado = (
                 f"Texto OCR limpio: {texto}\n"
+                f"Variante OCR útil: {variante}\n"
                 f"DOT detectado: {dot}\n"
                 f"Ángulo de deskew aplicado: {angulo:.2f} grados\n"
                 f"Antigüedad aproximada: {antiguedad_txt}\n"
@@ -537,7 +769,9 @@ class AplicacionDOT:
             self.label_resultado.configure(text=texto_resultado)
 
         except Exception as e:
-            messagebox.showerror("Error", str(e))
+            import traceback
+            traceback.print_exc()
+            messagebox.showerror("Error", f"{type(e).__name__}: {e}")
 
 
 # ============================================================
